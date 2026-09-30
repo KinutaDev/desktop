@@ -173,12 +173,52 @@ defmodule Desktop.Env do
     {:noreply, state}
   end
 
-  def handle_info(:reconnect, state = %Env{}) do
+  def handle_info(:reconnect, state = %Env{windows: windows}) do
     if Desktop.OS.type() == IOS do
       for endpoint <- endpoints() do
         if Kernel.function_exported?(:ranch, :suspend_listener, 1) do
           apply(:ranch, :suspend_listener, [endpoint])
           apply(:ranch, :resume_listener, [endpoint])
+        end
+      end
+
+      # Bandit-based endpoints run on ThousandIsland instead of Ranch and are
+      # unaffected by the branch above (Kernel.function_exported?/3 simply
+      # returns false when :ranch isn't loaded, so both branches can coexist
+      # safely in an app that only uses one or the other). ThousandIsland has
+      # no equivalent auto-discoverable listener registry (unlike Ranch's
+      # :ranch_server ETS table used by endpoints/0 below), so the host app
+      # declares its Bandit endpoint module(s) explicitly:
+      #
+      #     config :desktop, endpoints: [MyAppWeb.Endpoint]
+      if Kernel.function_exported?(ThousandIsland.Server, :suspend, 1) do
+        for endpoint <- Application.get_env(:desktop, :endpoints, []) do
+          for scheme <- [:http, :https] do
+            case apply(Bandit.PhoenixAdapter, :bandit_pid, [endpoint, scheme]) do
+              {:ok, pid} when is_pid(pid) ->
+                apply(ThousandIsland.Server, :suspend, [pid])
+                apply(ThousandIsland.Server, :resume, [pid])
+
+                # `port: 0` (the http config recommended in
+                # guides/your_first_desktop_app.md) means resume/1 above may
+                # bind to a brand new OS-assigned port. Nothing previously
+                # re-announced that new URL to the native side, so an
+                # already-open window would keep retrying the old, now-dead
+                # port forever. Desktop.Window.show/2 with an explicit url
+                # bypasses its last_url cache and re-triggers the same
+                # native load-url path used at startup.
+                if scheme == :http do
+                  new_url = endpoint.url()
+
+                  for window <- windows do
+                    Desktop.Window.show(window, new_url)
+                  end
+                end
+
+              _ ->
+                :ok
+            end
+          end
         end
       end
     end
